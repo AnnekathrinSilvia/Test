@@ -1,0 +1,296 @@
+---
+title: >
+  Using GeDi on the macrophage dataset (ERP020977)
+author:
+- name: Annekathrin Silvia Nedwed
+  affiliation: 
+  - &id1 Institute of Medical Biostatistics, Epidemiology and Informatics (IMBEI), Mainz<br>
+  email: anneludt@uni-mainz.de
+- name: Federico Marini
+  affiliation: 
+  - *id1
+  - &id2 Center for Thrombosis and Hemostasis (CTH), Mainz<br>
+- name: Konstantin Strauch
+  affiliation: 
+  - *id1
+date: "`r BiocStyle::doc_date()`"
+package: "`r BiocStyle::pkg_ver('GeneTonic')`"
+output: 
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+    code_download: true
+editor_options: 
+  chunk_output_type: console
+link-citations: true
+bibliography: "gedi_supplement.bib"
+---
+
+```{r setup, include=FALSE, cache=FALSE, eval = TRUE, echo = FALSE}
+library("knitr")
+opts_chunk$set(
+  fig.align = "center",
+  fig.show = "asis",
+  eval = TRUE,
+  fig.width = 10,
+  fig.height = 7,
+  tidy = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  size = "small",
+  comment = "##",
+  echo = TRUE,
+  results = "markup"
+)
+options(replace.assign = TRUE, width = 80)
+```
+
+# About the data
+
+The data illustrated in this document is an RNA-seq dataset, available at the European Nucleotide Archive under the accession code ERP020977 (https://www.ebi.ac.uk/ena/browser/view/ERP020977).
+
+The data is included in the `macrophage` package available on Bioconductor (https://www.bioconductor.org/packages/release/data/experiment/html/macrophage.html). The data was generated as part of the work to identify shared quantitative trait loci (QTLs) for chromatin accessibility and gene expression in human macrophages [@Alasoo2018] - the manuscript is available at https://www.nature.com/articles/s41588-018-0046-7.
+
+
+# Loading required packages
+
+We load the packages required to perform all the analytic steps presented in this document.
+
+```{r loadLibraries, results='hide'}
+library("DESeq2")
+library("topGO")
+library("pcaExplorer")
+library("ideal")
+library("GeneTonic")
+library("apeglm")
+library("dplyr")
+library("msigdbr")
+library("macrophage")
+```
+
+# Data processing
+
+Before we can use the data the data of the `macrophage` package in `GeDi`, we first have to preprocess and analyze the data. 
+
+For this, we first obtain the data from the package and generate a `DESeqDataset`. This step is also demonstrated and described in more detail in the package vignette of `GeDi`. The vignette is accessible through `browseVignette(GeDi)` after successfully installing the package. Similar to the the vignette, we will only use and compare the Interferon gamma treated and the naive samples. This comparison and the resulting prepared data for `Gedi` also mirror the example data available in `GeDi`.
+
+```{r create_dds}
+# Obtain the data from the macrophage package
+data("gse", package = "macrophage")
+
+# Create a DESeqDataset object from the data choosing the line and condition
+# of the samples as design.
+dds_macrophage <- DESeqDataSet(gse, design = ~line + condition)
+
+# Transform the Gencode identifiers to Ensembl identifiers
+rownames(dds_macrophage) <- substr(rownames(dds_macrophage), 1, 15)
+
+# Have a look at the object
+dds_macrophage
+```
+
+
+## Differential expression analysis
+After we have set up the the `DESeq2` object of the `macrophage` dataset, we can follow the `DESeq2` workflow and determine the differentially expressed genes. 
+
+We use a False Discovery Rate of 5% similar to the vignette of `GeDi`.
+
+However, before we perform the DE analysis, we filter for low expressed genes. In this example we filter all genes that do not have at least 10 counts in at least 6 samples (where 6 is the size of the smallest group in the data).
+
+```{r de-macrophage1, cache=TRUE}
+# Filter genes based on read counts
+# Calculate the number of genes with at least 10 counts in at least 6 samples
+keep <- rowSums(counts(dds_macrophage) >= 10) >= 6
+
+# Subset the DESeqDataSet object to keep only the selected genes
+dds_macrophage <- dds_macrophage[keep, ]
+
+# Have a look at the resulting DESeqDataSet object
+dds_macrophage
+
+# Set the false discovery rate to 5%
+FDR <- 0.05
+
+# Perform the differential gene expression analysis 
+dds_macrophage <- DESeq(dds_macrophage)
+```
+
+After we performed the analysis, we extract the results for the condition IFNg vs naive as we only want to compare the Interferon gamma treated and the naive samples. Afterwards we print a summary overview of the previously extracted results. 
+
+In a last step, we add the gene symbols to the resulting `DataFrame` which will later serve as our Genes column in the input data to `GeDi`.
+
+```{r de-macrophage2}
+# Extract differentially expressed genes
+# Perform contrast analysis comparing "IFNg" condition to "naive" condition
+# Set a log2 fold change threshold of 1 and a significance level (alpha) of 0.05
+res_macrophage_IFNg_vs_naive <- results(dds_macrophage,
+  contrast = c("condition", "IFNg", "naive"),
+  lfcThreshold = 1, alpha = 0.05
+)
+
+# Print a summary overview of the results
+summary(res_macrophage_IFNg_vs_naive)
+
+# Add gene symbols to the results in a column "SYMBOL"
+res_macrophage_IFNg_vs_naive$SYMBOL <- rowData(dds_macrophage)$SYMBOL
+```
+
+## Functional enrichment analysis
+
+Following the differential expression analysis, we perform a functional enrichment analysis using the `topGO` package. Before the analysis, we first determine the set of background genes to be used, which in our case will be the set of expressed genes in the data. We also transform the results of our DE analysis to fit the format expectation of the `topGOtable` function.
+
+
+```{r enrich-macro, cache=TRUE}
+# Determine the set of background genes as all genes expressed in the dataset
+geneUniverseExpr <- rowData(dds_macrophage)$SYMBOL[rowSums(counts(dds_macrophage)) > 0]
+
+# Extract gene symbols from the DESeq2 results object where FDR is below 0.05
+# The function deseqresult2df is used to convert the DESeq2 results to a 
+# dataframe format
+# FDR is set to 0.05 to filter significant results
+de_symbols_IFNg_vs_naive <- deseqresult2df(res_macrophage_IFNg_vs_naive, FDR = 0.05)$SYMBOL
+
+# Perform Gene Ontology enrichment analysis using the topGOtable function from 
+# the "pcaExplorer" package
+topGO_IFNg_vs_naive <- topGOtable(
+  DEgenes = de_symbols_IFNg_vs_naive,
+  BGgenes = geneUniverseExpr,
+  ontology = "BP",
+  geneID = "symbol",
+  addGeneToTerms = TRUE,
+  mapping = "org.Hs.eg.db",
+  topTablerows = 500
+)
+```
+
+## Preparing the data for GeDi
+
+After we have performed the functional enrichment analysis, the data is almost ready to be used with `GeDi`. However, in its current state the data is not yet in the correct format expected by `GeDi`. `GeDi` expects the data to have at least two columns, one named Genesets containing some form of geneset identifiers and one named Genes containing a list of genes belonging to the genesets. While this is not strictly necessary to use `GeDi` on the data, it facilitates the use of the app as the app can be used straight away instead of having to wait for the data to be reformated. The correct data format is however necessary, if you want to use the data as a parameter as in `GeDi(topGO_IFNg_vs_naive)`.
+
+Nevertheless, we want to show you here, how to adapt the data from the `topGO` analysis to fit the data format requirements of `GeDi`. For this we simply have to rename the 'GO.ID' and the 'genes' column of the results as these two columns already contain the input data in the correct format.
+
+```{r renamecolumns, eval=TRUE}
+# Rename columns in the topGO_IFNg_vs_naive dataframe
+# Change the column name "GO.ID" to "Genesets"
+names(topGO_IFNg_vs_naive)[names(topGO_IFNg_vs_naive) == "GO.ID"] <- "Genesets"
+
+# Change the column name "genes" to "Genes"
+names(topGO_IFNg_vs_naive)[names(topGO_IFNg_vs_naive) == "genes"] <- "Genes"
+```
+
+After we have renamed the columns, the data is now ready to be used in `GeDi`.
+
+
+# Running `GeDi` on the dataset
+
+Now we can start to explore our data using `GeDi`. For this you can either follow the chunks in this document to prepare the data or we can load the prepared object provided with the repository of this document (TODO: Add link to repro).
+
+
+```{r}
+macrophage_example <- readRDS("usecase_macrophage_example.RDS")
+```
+
+Once we have loaded the data, we can start the app and interactively explore the data set using:
+
+```{r eval=FALSE}
+GeDi(genesets = macrophage_example)
+```
+
+Once the app is started, you can have interactive guidance of the user interface and its features by usind the introductory tours of each panel of the app.
+
+## Using `GeDi`'s functions in analysis reports 
+TODO: Do something similar for GeDi?
+The functionality of `GeneTonic` can be used also as standalone functions, to be called for example in existing analysis reports in RMarkdown, or R scripts.  
+In the following chunks, we show how it is possible to call some of the functions on the dataset of the `macrophage` package.
+
+```{r graphs, eval = F}
+em <- enrichment_map(gtl = gtl_macrophage, 
+                     n_gs = 100,
+                     color_by = "z_score")
+
+em %>%
+  visIgraph() %>%
+  visOptions(
+    highlightNearest = list(
+      enabled = TRUE,
+      degree = 1,
+      hover = TRUE
+    ),
+    nodesIdSelection = TRUE
+  )
+```
+
+Focusing on individual genesets, we can use `gs_heatmap()` and `gs_volcano()` as in the lines that follow:
+
+```{r graphs2, eval = F}
+gs_heatmap(
+  se = vst_macrophage,
+  gtl = gtl_macrophage,
+  geneset_id = res_enrich$gs_id[1],
+  cluster_columns = TRUE,
+  FDR = FDR)
+
+signature_volcano(
+  gtl = gtl_macrophage,
+  geneset_id = res_enrich$gs_id[1],
+  FDR = FDR
+)
+```
+
+If an overview of the affected pathways is desired, one can apply the fuzzy clustering algorithm on the enrichment results, and obtain visual summaries focused on the genesets identified as representative ones of each cluster.
+
+```{r graphs3, eval = F}
+res_enrich_subset <- res_enrich[1:100, ]
+fuzzy_subset <- gs_fuzzyclustering(
+  res_enrich = res_enrich_subset,
+  n_gs = nrow(res_enrich_subset),
+  gs_ids = NULL,
+  similarity_matrix = NULL,
+  similarity_threshold = 0.35,
+  fuzzy_seeding_initial_neighbors = 3,
+  fuzzy_multilinkage_rule = 0.5
+)
+
+# show all genesets members of the first cluster
+DT::datatable(
+  fuzzy_subset[fuzzy_subset$gs_fuzzycluster == "1", ]
+)
+
+# list only the representative clusters
+DT::datatable(
+  fuzzy_subset[fuzzy_subset$gs_cluster_status == "Representative", ]
+)
+```
+
+Let's focus on the top 15 sets identified with the fuzzy clustering.
+
+```{r graphs4, eval = F}
+focus_genesets <- 
+  head(fuzzy_subset$gs_id[fuzzy_subset$gs_cluster_status == "Representative"], 15)
+
+score_mat <- gs_scores(se = vst_macrophage,
+                       gtl = gtl_macrophage)
+
+gs_scoresheat(score_mat,
+              n_gs = 0,
+              gs_ids = focus_genesets)
+
+gs_mds(
+  gtl = gtl_macrophage,
+  n_gs = 200,
+  mds_labels = 0,
+  gs_labels = focus_genesets)
+
+```
+
+
+
+# Session information {-}
+
+```{r}
+sessionInfo()
+```
+
+# Bibliography {-}

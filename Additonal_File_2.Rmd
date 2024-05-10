@@ -1,0 +1,384 @@
+---
+title: >
+  Using GeDi on the T cell dataset (GSE130842)
+author:
+- name: Annekathrin Silvia Nedwed
+  affiliation: 
+  - &id1 Institute of Medical Biostatistics, Epidemiology and Informatics (IMBEI), Mainz<br>
+  email: anneludt@uni-mainz.de
+- name: Arsenij Ustanzew
+  affiliation:
+  - *id1
+- name: Najla Abassi
+  affiliation:
+  - *id1
+- name: Shuqing Xu
+  affiliation:
+  - &id3 Institute for Organismic and Molecular Evolution (iomE), Mainz<br>
+- name: Federico Marini
+  affiliation: 
+  - *id1
+  - &id2 Center for Thrombosis and Hemostasis (CTH), Mainz<br>
+- name: Konstantin Strauch
+  affiliation: 
+  - *id1
+date: "`r BiocStyle::doc_date()`"
+package: "`r BiocStyle::pkg_ver('GeDi')`"
+output: 
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+    code_download: true
+editor_options: 
+  chunk_output_type: console
+link-citations: true
+bibliography: "gedi_supplement.bib"
+---
+
+```{r setup, include=FALSE, cache=FALSE, eval = TRUE, echo = FALSE}
+library("knitr")
+opts_chunk$set(
+  fig.align = "center",
+  fig.show = "asis",
+  eval = TRUE,
+  fig.width = 10,
+  fig.height = 7,
+  tidy = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  size = "small",
+  comment = "##",
+  echo = TRUE,
+  results = "markup"
+)
+options(replace.assign = TRUE, width = 80)
+```
+
+# About the data
+
+The data illustrated in this document is an RNA-seq dataset, available at the Gene Expression Omnibus under the accession code [GSE130842](https://www.ncbi.xyz/geo/query/acc.cgi?acc=GSE130842).
+
+The data represents a mouse data set of 32 different samples across different tissues and conditions. The data is part of a manuscript to analyse different tissue regulatory T cell populations [@Delacher2020] - the manuscript is available on [Pubmed] (https://pubmed.ncbi.nlm.nih.gov/31924477/).
+
+
+# Loading required packages
+
+We load the packages required to perform all the analytic steps presented in this document.
+
+```{r loadLibraries, results='hide'}
+library("DESeq2")
+library("topGO")
+library("pcaExplorer")
+library("ideal")
+library("GeneTonic")
+library("apeglm")
+library("dplyr")
+library("org.Mm.eg.db")
+library("GeDi")
+library("visNetwork")
+```
+
+# Data processing
+
+In this example we analyse data available on the Gene Expression Omnibus under 
+accession number [GSE130842](https://www.ncbi.xyz/geo/query/acc.cgi?acc=GSE130842).
+From the available data, we downloaded the 
+GSE130842_Count_table_Delacher_et_al_2019.xlsx Excel file, which is also 
+available in the [Github](https://github.com/AnnekathrinSilvia/manuscript_GeDi) 
+repository to this document.
+
+We will preprocess the data for its use in `r BiocStyle::Biocpkg("Gedi")` 
+according to the workflow described in the package vignette of 
+`r BiocStyle::Biocpkg("Gedi")`. The package vignette is available through using
+the command `browseVignette(GeDi)` after successfully installing the package.
+
+In the first step of the preprocessing, we will generate a `DESeqDataset` 
+[@Love2014] from the count table available in the Excel file. We will further
+preprocess this object, called `dds_tregs`, to prepare the data for its use in 
+`GeDi`. We will also read in some metadata that we have set up for the dataset.
+This file will also be available in the [repository](https://github.com/AnnekathrinSilvia/manuscript_GeDi) 
+as well as the final generated `dds_tregs`.
+
+```{r create_dds}
+# We read in the data form the Excel file
+count_df <- readxl::read_excel("GSE130842_Count_table_Delacher_et_al_2019.xlsx")
+
+# We transform the data into a matrix and set the gene ids as the rownames of 
+# the final matrix
+count_matrix <- as.matrix(count_df[, -1])
+rownames(count_matrix) <- count_df$ID
+
+# We read in the metadata
+coldata <- readxl::read_excel("GSE130842_metadata.xlsx")
+coldata
+
+# We build up the DESeqDataset object from the count data and the metadata
+# As design we will choose the group of the data which indicates the tissue
+# of origin as well as t5he type of Tcells in the sample
+dds_tregs <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = coldata,
+  design = ~group
+)
+
+# We transform the columnnames of the dds_tregs to include the replicate number
+# of each sample
+colnames(dds_tregs) <- paste0(coldata$group, "_r", coldata$rep_nr)
+
+# Lastly we can have a look at our DESeqDataset object 
+dds_tregs
+```
+
+Now we can see that we have set up a `DESeqDataset` object on all the available 
+samples. However, in this analysis, we will only focus on a subset of samples as
+shown in Figure 2 of the original manuscript [@Delacher2020]. Hence, we will 
+subset our `dds_tregs` object to the groups used in the figure.
+
+```{r subsetDDS}
+dds_tregs <- dds_tregs[, dds_tregs$group %in% 
+                          c("KLRGminusNFIL3minusTreg" ,
+                            "KLRGminusNFIL3plusTreg",
+                            "KLRGplusNFIL3plusTreg",
+                            "tisTregST2_BM",
+                            "tisTregST2_Fat",
+                            "tisTregST2_Liver",
+                            "tisTregST2_Lung",
+                            "tisTregST2_Skin"
+                            )]
+
+dds_tregs$group <- droplevels(dds_tregs$group)
+design(dds_tregs) <- ~group
+```
+
+
+## Exploratory data analysis
+In a first analysis step, we do an exploratory data analysis as described in 
+[@Ludt2022] using the `r BiocStyle::Biocpkg("pcaExplorer")` package [@Marini2019].
+
+We will first apply a variance-stabilizing transformation before we plot a PCA 
+and a sample-to-sample distance heatmap.
+
+```{r vst_tranformation}
+# Apply the vst transformation
+vst_tregs <- vst(dds_tregs)
+
+# Plot the PCA
+pcaExplorer::pcaplot(vst_tregs,
+                     intgroup = "group",
+                     ntop = 1000,
+                     title = "PCA plot - top 1000 most variable genes",
+                     ellipse = FALSE,
+                     text_labels = FALSE
+                     )
+
+# Plot a sampl-to-sample distance heatmap
+pheatmap::pheatmap(as.matrix(dist(t(assay(vst_tregs)))))
+```
+
+
+## Differential expression analysis
+
+After we have done some exploratory data analysis, we can proceed with the 
+differential expression analysis. We use the `r BiocStyle::Biocpkg("DESeq2")` 
+package [@Love2014] for this. The False Discovery Rate is set to 5%.
+
+Before, we run the `r BiocStyle::Biocpkg("DESeq2")` analysis, we first match the
+gene ids to gene names using the `r BiocStyle::Biocpkg("pcaExplorer")` package 
+[@Marini2019]. With this we can add the gene names to the results, which are 
+usually better known than gene ids. The gene names will also be later used
+as "Genes" column in the input for `r BiocStyle::Biocpkg("GeDi")`.
+
+
+```{r de-tregs1, cache=TRUE}
+# Create an annodation data frame mapping gene ids to gene names. 
+anno_df <- pcaExplorer::get_annotation_orgdb(dds_tregs,"org.Mm.eg.db","ENSEMBL")
+# Assign a new column SWYMBOL to the dds_tregs object, which will be later used
+# as "Genes" column in the input for GeDi
+rowData(dds_tregs)$SYMBOL <- anno_df$gene_name[match(rownames(dds_tregs),
+                                                     anno_df$gene_id)]
+
+# Set the false discovery rate to 5%
+FDR <- 0.05
+
+# Perform the differential gene expression analysis 
+dds_tregs <- DESeq(dds_tregs)
+```
+
+After we performed the analysis, we extract the results for the condition 
+`KLRGplusNFIL3plusTreg vs KLRGminusNFIL3minusTreg` as we only want to compare 
+these two groups. Afterwards we print a summary overview of the previously
+extracted results. 
+
+We also use the `r BiocStyle::Biocpkg("ideal")` package [@Marini2020] to plot an
+MA-plot of the results.
+
+In a last step, we add the gene symbols to the resulting `DataFrame` which will 
+later serve as our "Genes" column in the input data to `GeDi`.
+
+```{r de-tregs2}
+# Extract differentially expressed genes
+# Perform contrast analysis comparing "KLRGplusNFIL3plusTreg" group to "KLRGminusNFIL3minusTreg" group
+# Set a log2 fold change threshold of 1 and a significance level (alpha) of 0.05
+res_tregs <- results(dds_tregs,
+  contrast = c("group", "KLRGplusNFIL3plusTreg", "KLRGminusNFIL3minusTreg"),
+  lfcThreshold = 1, alpha = 0.05
+)
+
+# Print a summary overview of the results
+summary(res_tregs)
+
+# Plot an MA-plot of the results
+ideal::plot_ma(res_tregs, 
+               ylim = c(-5, 5), 
+               title = "MAplot - KLRGplusNFIL3plusTreg vs KLRGminusNFIL3minusTreg")
+
+# Add gene symbols to the results in a column "SYMBOL"
+res_tregs$SYMBOL <- rowData(dds_tregs)$SYMBOL
+```
+
+## Functional enrichment analysis
+
+Following the differential expression analysis, we perform a functional enrichment 
+analysis using the `r BiocStyle::Biocpkg("topGO")` package [@topGO]. Before the analysis, 
+we first determine the set of background genes to be used, which in our case will
+be the set of expressed genes in the data. We also transform the results of our 
+DE analysis to fit the format expectation of the `topGOtable` function from the 
+`r BiocStyle::Biocpkg("pcaExplorer")` package [@Marini2019].
+
+
+```{r enrich-macro, cache=TRUE}
+# Determine the set of background genes as all genes expressed in the dataset
+geneUniverseExpr <- rowData(dds_tregs)$SYMBOL[rowSums(counts(dds_tregs)) > 0]
+
+# Extract gene symbols from the DESeq2 results object where FDR is below 0.05
+# The function deseqresult2df is used to convert the DESeq2 results to a 
+# dataframe format
+# FDR is set to 0.05 to filter significant results
+de_symbols <- deseqresult2df(res_tregs, FDR = 0.05)$SYMBOL
+
+# Perform Gene Ontology enrichment analysis using the topGOtable function from 
+# the "pcaExplorer" package
+topGO_tregs <- topGOtable(
+  DEgenes = de_symbols,
+  BGgenes = geneUniverseExpr,
+  ontology = "BP",
+  geneID = "symbol",
+  addGeneToTerms = TRUE,
+  mapping = "org.Mm.eg.db",
+  topTablerows = 500
+)
+```
+
+## Preparing the data for GeDi
+
+After we have performed the functional enrichment analysis, the data is almost 
+ready to be used with `r BiocStyle::Biocpkg("GeDi")`. However, in its current 
+state the data is not yet in the correct format expected by `r BiocStyle::Biocpkg("GeDi")`.
+`r BiocStyle::Biocpkg("GeDi")` expects the data to have at least two columns, 
+one named "Genesets" containing some form of geneset identifiers and one named 
+"Genes" containing a list of genes belonging to the genesets. While this is not 
+strictly necessary to use `r BiocStyle::Biocpkg("GeDi")` on the data, it 
+facilitates the use of the app as the app can be used straight away instead of
+having to wait for the data to be reformated. The correct data format is however
+necessary, if you want to use the data as a parameter as in `GeDi(topGO_tregs)`.
+
+Nevertheless, we want to show you here, how to adapt the data from the 
+`r BiocStyle::Biocpkg("topGO")` analysis to fit the data format requirements 
+of `r BiocStyle::Biocpkg("GeDi")`. For this we simply have to rename the 
+'GO.ID' and the 'genes' column of the results as these two columns already 
+contain the input data in the correct format.
+
+```{r renamecolumns, eval=TRUE}
+# Rename columns in the topGO_tregs dataframe
+# Change the column name "GO.ID" to "Genesets"
+names(topGO_tregs)[names(topGO_tregs) == "GO.ID"] <- "Genesets"
+
+# Change the column name "genes" to "Genes"
+names(topGO_tregs)[names(topGO_tregs) == "genes"] <- "Genes"
+```
+
+After we have renamed the columns, the data is now ready to be used in 
+`r BiocStyle::Biocpkg("GeDi")`.
+
+
+# Running `GeDi` on the dataset
+
+Now we can start to explore our data using `r BiocStyle::Biocpkg("GeDi")`. For 
+this you can either follow the chunks in this document to prepare the data or 
+we can load the prepared object provided with the 
+[repository](https://github.com/AnnekathrinSilvia/manuscript_GeDi) of this 
+document.
+
+```{r loadPreprocessedData}
+tregs_example <- readRDS("usecase_tregs_example.RDS")
+```
+
+Once we have loaded the data, we can start the app and interactively explore 
+the data set using:
+
+```{r runGeDi, eval=FALSE}
+GeDi(genesets = tregs_example)
+```
+
+Once the app is started, you can have interactive guidance of the user 
+interface and its features by usind the introductory tours of each panel of 
+the app.
+
+## Using `GeDi`'s functions in analysis reports 
+The functionality of `r BiocStyle::Biocpkg("GeDi")` can be used also as 
+standalone functions, to be called for example in existing analysis reports 
+in RMarkdown, or R scripts.  
+
+In the following chunks, we show how it is possible to call some of the functions
+on the dataset presented in this document.
+
+```{r distance_Scores}
+# First we extract a representation of all genes in the data
+genes <- GeDi::getGenes(topGO_tregs)
+
+# Next we calculate one distance score matrix for the data
+mm_score <- GeDi::getMeetMinMatrix(genesets = genes)
+rownames(mm_score) <- colnames(mm_score) <- topGO_tregs$Genesets
+
+# We can use several plotting functions of GeDi to plot the data
+GeDi::distanceHeatmap(mm_score)
+
+GeDi::distanceDendro(mm_score)
+
+adj <- GeDi::getAdjacencyMatrix(mm_score, 0.3)
+rownames(adj) <- colnames(adj) <- topGO_tregs$Genesets
+
+g <- GeDi::buildGraph(adj, topGO_tregs, topGO_tregs$Genesets)
+visNetwork::visIgraph(g)
+```
+
+After we have calculated distance scores, we can cluster the data and visualize 
+the results in several different ways. 
+
+```{r clustering}
+# First we are clustering the data
+clustering <- GeDi::clustering(mm_score, threshold = 0.3, cluster_method = "markov")
+
+# Next we can visualize the results of the clustering
+g <- GeDi::buildClusterGraph(clustering,
+                        topGO_tregs, 
+                        topGO_tregs$Genesets,
+                        color_by = "Annotated")
+visNetwork::visIgraph(g)
+
+g <- GeDi::getBipartiteGraph(clustering, topGO_tregs$Genesets, genes)
+visNetwork::visIgraph(g) %>%
+        visIgraphLayout(layout = "layout_as_bipartite")
+
+GeDi::enrichmentWordcloud(topGO_tregs)
+```
+
+# Session information {-}
+
+```{r}
+sessionInfo()
+```
+
+# Bibliography {-}
